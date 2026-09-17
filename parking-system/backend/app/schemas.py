@@ -76,6 +76,19 @@ class PricingUpdate(BaseModel):
     daily_cap: Optional[float] = None
 
 
+class TransferRequest(BaseModel):
+    current_plate: str
+    new_plate: str
+
+    @field_validator("current_plate", "new_plate")
+    @classmethod
+    def normalize_plate(cls, v: str) -> str:
+        v = v.strip().upper().replace(" ", "")
+        if not v:
+            raise ValueError("plate must not be empty")
+        return v
+
+
 class SensorEvent(BaseModel):
     """Simulated IR/ultrasonic: a slot became occupied or vacant."""
     slot_id: int

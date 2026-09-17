@@ -133,3 +133,129 @@ def test_simulate_sensor_exit_checks_out():
     assert r.json()["amount"] >= 50
     compact = next(s for s in client.get("/slots").json() if s["code"] == "C-01")
     assert compact["is_occupied"] is False
+
+
+def test_daily_log_summary_lists_vehicle_types_and_profit_for_a_day():
+    day = datetime(2026, 9, 17)
+    db = SessionLocal()
+    db.add(models.Ticket(
+        plate="CAR1",
+        vehicle_type=models.SlotType.compact,
+        slot_id=1,
+        entry_time=day.replace(hour=9),
+        exit_time=day.replace(hour=10),
+        amount_charged=80,
+        status=models.TicketStatus.closed,
+    ))
+    db.add(models.Ticket(
+        plate="CAR2",
+        vehicle_type=models.SlotType.standard,
+        slot_id=2,
+        entry_time=day.replace(hour=11),
+        exit_time=day.replace(hour=12),
+        amount_charged=100,
+        status=models.TicketStatus.closed,
+    ))
+    db.add(models.Ticket(
+        plate="CAR3",
+        vehicle_type=models.SlotType.ev,
+        slot_id=3,
+        entry_time=day.replace(hour=13),
+        exit_time=day.replace(hour=14),
+        amount_charged=140,
+        status=models.TicketStatus.closed,
+    ))
+    db.commit()
+    summary = crud.get_day_report(db, day.date())
+    db.close()
+
+    assert summary["total_cars"] == 3
+    assert summary["cars_by_type"]["compact"] == 1
+    assert summary["cars_by_type"]["standard"] == 1
+    assert summary["cars_by_type"]["ev"] == 1
+    assert summary["total_profit"] == 320
+    assert summary["per_car"]["CAR1"]["amount_charged"] == 80
+    assert summary["per_car"]["CAR2"]["amount_charged"] == 100
+    assert summary["per_car"]["CAR3"]["amount_charged"] == 140
+
+
+def test_daily_report_and_alerts_endpoint():
+    day = datetime(2026, 9, 17)
+    db = SessionLocal()
+    db.add(models.Ticket(
+        plate="REPORT1",
+        vehicle_type=models.SlotType.compact,
+        slot_id=1,
+        entry_time=day.replace(hour=9),
+        exit_time=day.replace(hour=10),
+        amount_charged=80,
+        status=models.TicketStatus.closed,
+    ))
+    db.add(models.Ticket(
+        plate="REPORT2",
+        vehicle_type=models.SlotType.standard,
+        slot_id=2,
+        entry_time=day.replace(hour=11),
+        exit_time=day.replace(hour=12),
+        amount_charged=100,
+        status=models.TicketStatus.closed,
+    ))
+    db.commit(); db.close()
+
+    r = client.get("/daily-report", params={"date": day.date().isoformat()})
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["total_cars"] == 2
+    assert payload["total_profit"] == 180
+
+    r = client.get("/alerts")
+    assert r.status_code == 200
+    assert isinstance(r.json(), list)
+
+
+def test_dirty_rate_card_is_normalized_and_bad_rows_skipped():
+    raw = [
+        {"spot_type": " Compact ", "first_hour": "$12.00", "extra_hour": "1200", "daily_cap": "300"},
+        {"spot_type": "COMPACT", "first_hour": "12", "extra_hour": "4", "daily_cap": "250"},
+        {"spot_type": "EV", "first_hour": "$14.00", "extra_hour": "700", "daily_cap": "420"},
+        {"spot_type": "invalid", "first_hour": "NaN", "extra_hour": "9", "daily_cap": "180"},
+        {"spot_type": "standard", "first_hour": "15", "extra_hour": "7.5", "daily_cap": "250"},
+    ]
+
+    cleaned, warnings = crud.normalize_rate_card(raw)
+    assert models.SlotType.compact in cleaned
+    assert cleaned[models.SlotType.compact]["first_hour_rate"] == 12.0
+    assert cleaned[models.SlotType.compact]["additional_hour_rate"] == 12.0
+    assert cleaned[models.SlotType.standard]["first_hour_rate"] == 15.0
+    assert cleaned[models.SlotType.ev]["first_hour_rate"] == 14.0
+    assert any("invalid" in str(w).lower() for w in warnings)
+
+
+def test_clock_advance_auto_closes_sessions_over_24_hours():
+    client.post("/checkin", json={"plate": "LATE1", "vehicle_type": "compact"})
+    db = SessionLocal()
+    ticket = db.query(models.Ticket).filter(models.Ticket.plate == "LATE1").first()
+    ticket.entry_time = datetime.utcnow() - timedelta(hours=25)
+    db.commit()
+    db.close()
+
+    r = client.post("/clock", json={"now": (datetime.utcnow() + timedelta(hours=1)).isoformat()})
+    assert r.status_code == 200
+    assert r.json()["closed_count"] >= 1
+    assert client.get("/search", params={"plate": "LATE1"}).status_code == 404
+
+
+def test_plate_transfer_keeps_session_alive_with_same_entry_time():
+    r = client.post("/checkin", json={"plate": "ORIG1", "vehicle_type": "standard"})
+    assert r.status_code == 201
+    before = client.get("/search", params={"plate": "ORIG1"}).json()
+
+    r = client.post("/transfer", json={"current_plate": "ORIG1", "new_plate": "NEW1"})
+    assert r.status_code == 200
+    assert r.json()["plate"] == "NEW1"
+    assert r.json()["entry_time"] == before["entry_time"]
+
+    assert client.get("/search", params={"plate": "ORIG1"}).status_code == 404
+    assert client.get("/search", params={"plate": "NEW1"}).status_code == 200
+    slot = next(s for s in client.get("/slots").json() if s["active_ticket"] is not None)
+    assert slot["active_ticket"]["plate"] == "NEW1"
